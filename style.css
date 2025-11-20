@@ -4,8 +4,12 @@ body {
   padding: 0;
   height: 100%;
 
-  font-family: system-ui, sans-serif;
+  font-family: "Courier New", Courier, monospace;
   background: #000;
+}
+
+a {
+  color: #fff;
 }
 
 #app {
@@ -35,7 +39,7 @@ body {
   position: fixed;
   top: 0;
   left: 0;
-  width: 80px;
+  width: 40px;
   height: 100%;
   background: rgba(0, 0, 0, 0.8);
   z-index: 3;
@@ -50,7 +54,7 @@ body {
   justify-content: space-between; /* keep first year at top and last at bottom */
   align-items: center;
   height: 100%;
-  font-size: 13px;
+  font-size: 10px;
   padding: 0.5em 0;
 }
 
@@ -67,7 +71,7 @@ body {
     to bottom,
     rgba(0, 0, 0, 0) 0%,
     rgba(97, 97, 97, 0.3) 15%,
-    rgba(151, 151, 151, 0.5) 50%,
+    rgba(195, 195, 195, 0.5) 50%,
     rgba(97, 97, 97, 0.3) 85%,
     rgba(0, 0, 0, 0) 100%
   );
@@ -89,41 +93,6 @@ body {
   padding: 0;
 }
 
-.image-card {
-  left: 50%;
-  transform: translateX(-50%);
-}
-
-.image-card.expanded {
-  /* preserve centering while scaling */
-  transform: translateX(-50%) scale(1.08);
-}
-
-.image-card {
-  opacity: 0;
-  transition: opacity 0.3s ease, transform 0.25s ease;
-}
-.image-card.visible {
-  opacity: 1;
-}
-
-.image-card {
-  position: relative;
-  max-width: 320px;
-  cursor: pointer;
-  transition: transform 0.3s, max-width 0.3s;
-}
-
-.image-card img {
-  width: 100%;
-}
-
-/* hide captions by default; show only in expanded view */
-.image-card p,
-.image-card a {
-  display: none;
-}
-
 /* ensure timeline fills viewport within #app and overlay sits above content */
 #timeline {
   height: 100vh;
@@ -132,23 +101,15 @@ body {
   z-index: 99999;
 }
 
-/* Expanded image */
-.image-card.expanded {
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%) scale(1);
-  max-width: 80vw;
-  max-height: 80vh;
-  z-index: 9999;
+.image-card {
+  position: absolute;
+  max-width: 220px;
+  cursor: pointer;
+  transition: opacity 0.3s ease, transform 0.25s ease;
 }
 
-/* when expanded, show caption and source under the image */
-.image-card.expanded p,
-.image-card.expanded a {
-  display: block;
-  color: white;
-  padding: 12px;
+.image-card img {
+  width: 100%;
 }
 
 /* overlay to capture outside clicks */
@@ -161,12 +122,77 @@ body {
   z-index: 9998;
 }
 
-/* layout for grouped images per year - flush-left stacking */
-.image-group-left {
-  pointer-events: none; /* grouping element doesn't capture clicks */
+.fullscreen-card {
+  box-sizing: border-box;
 }
-.image-group-left .image-card {
+
+.fullscreen-caption {
+  font-size: 12px;
+  font-weight: lighter;
+  color: white;
+}
+
+.fullscreen-caption a {
+  font-size: 10px;
+}
+
+.card-caption {
+  font-size: 0.5rem;
+  line-height: 1.2;
+  color: #ffffff;
+  background: rgba(0, 0, 0, 0.5);
+}
+
+.text-card {
+  position: absolue;
+  max-width: 350px;
+  background: rgba(0, 0, 0, 0.65);
+  color: white;
+  border-radius: 6px;
+  padding: 5px;
+  font-size: 12px;
+  line-height: 1.32;
+  z-index: 12;
+  backdrop-filter: blur(4px);
   pointer-events: auto;
-  left: 0; /* we'll set the group's left, cards inside offset via JS */
-  transform: none; /* disable center transform inside group */
 }
+
+.text-card-inner {
+  width: 100%;
+}
+
+/* Title screen */
+#title-screen {
+  height: 100vh;
+  width: 100%;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  position: relative;
+  z-index: 1000;
+}
+
+#title-screen .title-inner {
+  text-align: center;
+  padding: 2rem;
+}
+
+#title-screen h1 {
+  margin: 0;
+  font-size: clamp(28px, 8vw, 60px);
+  line-height: 1;
+  letter-spacing: 0.02em;
+  font-weight: 200;
+}
+
+#title-screen .subtitle {
+  width: 60%;
+  margin-left: 40%;
+  margin-top: 12px;
+  opacity: 0.85;
+  font-size: 28px;
+}
+
+/* end title screen */
