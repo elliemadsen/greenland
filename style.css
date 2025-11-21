@@ -3,7 +3,6 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
-
   font-family: "Courier New", Courier, monospace;
   background: #000;
 }
@@ -39,7 +38,7 @@ a {
   position: fixed;
   top: 0;
   left: 0;
-  width: 40px;
+  width: 60px;
   height: 100%;
   background: rgba(0, 0, 0, 0.8);
   z-index: 3;
@@ -54,7 +53,7 @@ a {
   justify-content: space-between; /* keep first year at top and last at bottom */
   align-items: center;
   height: 100%;
-  font-size: 10px;
+  font-size: 14px;
   padding: 0.5em 0;
 }
 
@@ -97,13 +96,10 @@ a {
 #timeline {
   height: 100vh;
 }
-.overlay {
-  z-index: 99999;
-}
 
 .image-card {
   position: absolute;
-  max-width: 220px;
+  max-width: 300px;
   cursor: pointer;
   transition: opacity 0.3s ease, transform 0.25s ease;
 }
@@ -127,17 +123,37 @@ a {
 }
 
 .fullscreen-caption {
-  font-size: 12px;
+  font-size: 14px;
   font-weight: lighter;
   color: white;
 }
 
 .fullscreen-caption a {
-  font-size: 10px;
+  font-size: 12px;
+}
+
+/* Event marker on the map: small black dot with a label */
+.event-marker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #000;
+}
+.event-marker .dot {
+  width: 8px;
+  height: 8px;
+  background: #000;
+  border-radius: 50%;
+}
+.event-marker .label {
+  color: #000;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, 0.4);
 }
 
 .card-caption {
-  font-size: 0.5rem;
+  font-size: 12px;
   line-height: 1.2;
   color: #ffffff;
   background: rgba(0, 0, 0, 0.5);
@@ -148,9 +164,8 @@ a {
   max-width: 350px;
   background: rgba(0, 0, 0, 0.65);
   color: white;
-  border-radius: 6px;
   padding: 5px;
-  font-size: 12px;
+  font-size: 16px;
   line-height: 1.32;
   z-index: 12;
   backdrop-filter: blur(4px);
@@ -159,6 +174,21 @@ a {
 
 .text-card-inner {
   width: 100%;
+}
+
+/* overlay for card closeup */
+.overlay-closeup {
+  position: fixed;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
+  opacity: 0;
+  transition: opacity 220ms ease;
+  display: none;
+  /* set z-index stack: overlay < clone < caption */
+  z-index: 100000;
 }
 
 /* Title screen */
@@ -181,7 +211,7 @@ a {
 
 #title-screen h1 {
   margin: 0;
-  font-size: clamp(28px, 8vw, 60px);
+  font-size: clamp(28px, 8vw, 70px);
   line-height: 1;
   letter-spacing: 0.02em;
   font-weight: 200;
@@ -192,7 +222,7 @@ a {
   margin-left: 40%;
   margin-top: 12px;
   opacity: 0.85;
-  font-size: 28px;
+  font-size: 36px;
 }
 
 /* end title screen */

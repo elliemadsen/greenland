@@ -31,7 +31,7 @@ const map = new maplibregl.Map({
   container: "map",
   style: `https://api.maptiler.com/maps/hybrid/style.json?key=q2l5v7peOG9LJxJlnEZ2`,
   center: [-40, 76],
-  zoom: 2,
+  zoom: 2.5,
   pitch: 0,
   interactive: false,
   attributionControl: false,
@@ -54,7 +54,84 @@ map.on("load", () => {
     },
     before: map.getStyle().layers[0]?.id,
   });
+  // map is ready for markers
+  mapReady = true;
+  // ensure any events that should be visible at initial position get added
+  updateScrollMarker();
 });
+
+// Create a small DOM element for event marker (dot + label)
+function createEventMarkerElement(ev) {
+  const el = document.createElement("div");
+  el.className = "event-marker";
+  // small black dot
+  const dot = document.createElement("span");
+  dot.className = "dot";
+  // label
+  const label = document.createElement("span");
+  label.className = "label";
+  label.textContent = ev.name;
+
+  el.appendChild(dot);
+  el.appendChild(label);
+  return el;
+}
+
+function addEventMarker(ev) {
+  if (!mapReady) return;
+  if (activeEventMarkers[ev.name]) return;
+  const el = createEventMarkerElement(ev);
+  // use options form to be explicit about the element passed in
+  const marker = new maplibregl.Marker({ element: el, anchor: "center" })
+    .setLngLat([ev.lon, ev.lat])
+    .addTo(map);
+
+  // measure and compute horizontal offset so the DOT (not the whole element)
+  // is centered exactly at the map coordinate. Do this after layout has a
+  // chance to flush (next animation frame) so label sizes are accurate.
+  requestAnimationFrame(() => {
+    try {
+      const dot = el.querySelector(".dot");
+      if (dot) {
+        const elRect = el.getBoundingClientRect();
+        const dotRect = dot.getBoundingClientRect();
+        // dot center relative to the element's left
+        const dotCenter = dotRect.left - elRect.left + dotRect.width / 2;
+        const elCenter = elRect.width / 2;
+        // offset needed to move the element center so the dot aligns with the coordinate
+        // derived: offsetX = elCenter - dotCenter
+        const offsetX = Math.round(elCenter - dotCenter);
+        // setOffset expects [x, y] in pixels; positive x moves the element right
+        marker.setOffset([offsetX, 0]);
+      }
+    } catch (err) {
+      console.warn("Could not compute event marker offset:", err);
+    }
+  });
+
+  activeEventMarkers[ev.name] = marker;
+}
+
+function removeEventMarker(ev) {
+  const marker = activeEventMarkers[ev.name];
+  if (marker) {
+    marker.remove();
+    delete activeEventMarkers[ev.name];
+  }
+}
+
+// Show markers for events whose year <= currentYear, hide those with year > currentYear
+function updateMapForYear(currentYear) {
+  // safety
+  if (!timelineEvents || !Array.isArray(timelineEvents)) return;
+  timelineEvents.forEach((ev) => {
+    if (ev.year <= currentYear) {
+      if (!activeEventMarkers[ev.name]) addEventMarker(ev);
+    } else {
+      if (activeEventMarkers[ev.name]) removeEventMarker(ev);
+    }
+  });
+}
 // === Timeline / Scroll marker setup ===
 // timeline maps page scroll to years
 const startYear = 1940;
@@ -70,6 +147,31 @@ for (let y = startYear; y <= endYear; y += 5) {
 const marker = document.getElementById("scroll-marker");
 // Markers placed on the map for events with coordinates
 const eventMarkers = [];
+const timelineEvents = [
+  {
+    name: "Pituffik Space Base",
+    year: 1951,
+    lat: 76.5312,
+    lon: -68.7032,
+  },
+  { name: "Camp TUTO", year: 1954, lat: 76.15, lon: -67.8 },
+  { name: "Camp Century", year: 1960, lat: 77.1667, lon: -61.1333 },
+  { name: "Camp Fistclench", year: 1957, lat: 77.0, lon: -49.6 },
+  { name: "Project Iceworm", year: 1958, lat: 77.8, lon: -61.4 },
+  {
+    name: "Narsarsuaq Air Base",
+    year: 1941,
+    lat: 61.16,
+    lon: -45.43,
+  },
+  { name: "Inge Lehmann Station", year: 1950, lat: 69.14, lon: -49.95 },
+  { name: "Station Nord", year: 1952, lat: 81.6, lon: -16.6667 },
+  { name: "DYE-2 (DEW Line)", year: 1957, lat: 66.481, lon: -46.3 },
+];
+
+// Track active markers currently shown on the map (keyed by event name)
+const activeEventMarkers = {};
+let mapReady = false;
 
 // scrolling container (we render scrollbar on #app)
 const scrollContainer = document.getElementById("app") || window;
@@ -112,10 +214,12 @@ function updateScrollMarker() {
   }
 
   // Compute current year and highlight map markers based on content scroll
-  // TODO add zooms or text events here ?
-  // const currentYear = Math.round(
-  //   startYear + scrollPercent * (endYear - startYear)
-  // );
+  // Determine current year from scroll percent. Use floor so the event shows
+  // when the user has reached that year or passed it.
+  const currentYear = Math.floor(
+    startYear + scrollPercent * (endYear - startYear)
+  );
+  updateMapForYear(currentYear);
 }
 
 if (scrollContainer === window) {
@@ -325,19 +429,7 @@ let overlayEl = null;
 function ensureOverlay() {
   if (!overlayEl) {
     overlayEl = document.createElement("div");
-    overlayEl.className = "overlay";
-    // full-viewport dark overlay (hidden until used)
-    overlayEl.style.position = "fixed";
-    overlayEl.style.left = "0";
-    overlayEl.style.top = "0";
-    overlayEl.style.right = "0";
-    overlayEl.style.bottom = "0";
-    overlayEl.style.background = "rgba(0,0,0,0.6)";
-    overlayEl.style.opacity = "0";
-    overlayEl.style.transition = "opacity 220ms ease";
-    overlayEl.style.display = "none";
-    // set z-index stack: overlay < clone < caption
-    overlayEl.style.zIndex = "100000"; // overlay behind the clone
+    overlayEl.className = "overlay-closeup";
     document.body.appendChild(overlayEl);
   }
 }
@@ -534,7 +626,6 @@ function updateLayout() {
     const extraRatio = maxCount > 0 ? c / maxCount : 0;
     // spacing scales between basePixelsPerYear and basePixelsPerYear * stretchFactor
     const spacing = basePixelsPerYear * (1 + extraRatio * (stretchFactor - 1));
-    console.log("Year: " + y + " Pixels: " + spacing);
     yearSpacing.push(spacing);
     totalSpacing += spacing;
   }
