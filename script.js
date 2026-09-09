@@ -1,12 +1,15 @@
 // === CONFIG ===
-const IMAGE_SHEET_CSV_URL =
-  "https://docs.google.com/spreadsheets/d/e/2PACX-1vS4vK_K5j7xcOA8Xj0emE_oXbSe1dYFDuXJi2ytNcvKprG_5qMja_U9uH6ZFd5n51gmfd6rqOibu-90/pub?gid=480743348&single=true&output=csv";
-
-const TEXT_SHEET_CSV_URL =
-  "https://docs.google.com/spreadsheets/d/e/2PACX-1vS4vK_K5j7xcOA8Xj0emE_oXbSe1dYFDuXJi2ytNcvKprG_5qMja_U9uH6ZFd5n51gmfd6rqOibu-90/pub?gid=418918070&single=true&output=csv";
+const TIMELINE_SHEET_CSV_URL =
+  "https://docs.google.com/spreadsheets/d/e/2PACX-1vS4vK_K5j7xcOA8Xj0emE_oXbSe1dYFDuXJi2ytNcvKprG_5qMja_U9uH6ZFd5n51gmfd6rqOibu-90/pub?gid=301895579&single=true&output=csv";
 
 // List of possible extensions
 const extensions = ["jpg", "jpeg", "png", "webp"];
+
+// Parsed rows from the timeline sheet, in original sheet order. Declared
+// this early because computeYearLayout() (called eagerly below, before the
+// CSV has loaded) reads it -- referencing a `let` before its own later
+// declaration line runs is a ReferenceError, not just an empty array.
+let timelineRows = [];
 
 // Function to get the existing file path
 function getExistingImagePath(baseName) {
@@ -27,14 +30,25 @@ function getExistingImagePath(baseName) {
 }
 
 // === MapLibre Basemap ===
+const DEFAULT_MAP_CENTER = [-42, 71];
+const DEFAULT_MAP_ZOOM = 2.6;
+const CLOSEUP_MAP_ZOOM = 9;
+const SLIGHT_ZOOM_LEVEL = 5.5; // "Zoom in slightly" -- e.g. the DYE cluster, several sites at once
+
 const map = new maplibregl.Map({
   container: "map",
   style: `https://api.maptiler.com/maps/hybrid/style.json?key=q2l5v7peOG9LJxJlnEZ2`,
-  center: [-40, 76],
-  zoom: 2.5,
+  center: DEFAULT_MAP_CENTER,
+  zoom: DEFAULT_MAP_ZOOM,
   pitch: 0,
   interactive: false,
   attributionControl: false,
+});
+
+map.on("style.load", () => {
+  // Mercator flattens high-latitude landmasses like Greenland into a wildly
+  // oversized, stretched shape. Globe projection renders true relative size.
+  map.setProjection({ type: "globe" });
 });
 
 map.on("load", () => {
@@ -43,6 +57,26 @@ map.on("load", () => {
     if (layer.type === "symbol") {
       map.removeLayer(layer.id);
     }
+  });
+
+  // The satellite imagery over the Greenland ice sheet interior is often
+  // close to featureless flat grey/white at closeup zoom levels (real snow
+  // surface with little color variation, and/or coarse source imagery over
+  // such a remote area). A hillshade layer computed from actual elevation
+  // data reveals real surface relief (crevasse fields, sastrugi, ice domes)
+  // that flat color imagery alone doesn't show.
+  map.addSource("terrain-rgb", {
+    type: "raster-dem",
+    url: `https://api.maptiler.com/tiles/terrain-rgb-v2/tiles.json?key=q2l5v7peOG9LJxJlnEZ2`,
+    tileSize: 256,
+  });
+  map.addLayer({
+    id: "hillshade",
+    type: "hillshade",
+    source: "terrain-rgb",
+    paint: {
+      "hillshade-exaggeration": 0.9,
+    },
   });
 
   // Add a dark overlay to dim the satellite imagery
@@ -56,170 +90,831 @@ map.on("load", () => {
   });
   // map is ready for markers
   mapReady = true;
+  // The CSV fetch and this map "load" event race each other -- whichever
+  // finishes first must not skip this (precomputeSiteLabelOffsets no-ops
+  // until both mapReady and siteGroups are in place, so calling it from
+  // both finish lines is what actually guarantees it always runs once).
+  precomputeSiteLabelOffsets();
   // ensure any events that should be visible at initial position get added
   updateScrollMarker();
 });
 
-// Create a small DOM element for event marker (dot + label)
-function createEventMarkerElement(ev) {
+// Create a small DOM element for a site marker (dot + label). The dot's
+// color and the label's text are set later and can change over time (a site
+// can be renamed, transferred, or decommissioned) via updateMapForYear.
+function createSiteMarkerElement() {
   const el = document.createElement("div");
   el.className = "event-marker";
-  // small black dot
   const dot = document.createElement("span");
   dot.className = "dot";
-  // label
   const label = document.createElement("span");
   label.className = "label";
-  label.textContent = ev.name;
-
   el.appendChild(dot);
   el.appendChild(label);
   return el;
 }
 
-function addEventMarker(ev) {
-  if (!mapReady) return;
-  if (activeEventMarkers[ev.name]) return;
-  const el = createEventMarkerElement(ev);
-  // use options form to be explicit about the element passed in
-  const marker = new maplibregl.Marker({ element: el, anchor: "center" })
-    .setLngLat([ev.lon, ev.lat])
-    .addTo(map);
-
-  // measure and compute horizontal offset so the DOT (not the whole element)
-  // is centered exactly at the map coordinate. Do this after layout has a
-  // chance to flush (next animation frame) so label sizes are accurate.
+// Measure and compute horizontal offset so the DOT (not the whole element,
+// which includes the label) is centered exactly at the map coordinate, and
+// fold in that site's precomputed (one-time, not dynamic) label-repulsion
+// offset. Done after layout has a chance to flush so label sizes are
+// accurate, and re-run whenever the label text changes length (e.g. a rename).
+function centerMarkerDot(marker, el, siteKey) {
   requestAnimationFrame(() => {
     try {
       const dot = el.querySelector(".dot");
       if (dot) {
         const elRect = el.getBoundingClientRect();
         const dotRect = dot.getBoundingClientRect();
-        // dot center relative to the element's left
         const dotCenter = dotRect.left - elRect.left + dotRect.width / 2;
         const elCenter = elRect.width / 2;
-        // offset needed to move the element center so the dot aligns with the coordinate
-        // derived: offsetX = elCenter - dotCenter
         const offsetX = Math.round(elCenter - dotCenter);
-        // setOffset expects [x, y] in pixels; positive x moves the element right
-        marker.setOffset([offsetX, 0]);
+        const repulsion = siteLabelOffsets.get(siteKey) || { dx: 0, dy: 0 };
+        marker.setOffset([offsetX + repulsion.dx, repulsion.dy]);
       }
     } catch (err) {
       console.warn("Could not compute event marker offset:", err);
     }
   });
-
-  activeEventMarkers[ev.name] = marker;
 }
 
-function removeEventMarker(ev) {
-  const marker = activeEventMarkers[ev.name];
-  if (marker) {
-    marker.remove();
-    delete activeEventMarkers[ev.name];
+function addSiteMarker(site, status) {
+  if (!mapReady) return;
+  const el = createSiteMarkerElement();
+  el.querySelector(".label").textContent = status.name;
+  if (status.state !== "active") el.classList.add(status.state);
+
+  const marker = new maplibregl.Marker({ element: el, anchor: "center" })
+    .setLngLat([site.lon, site.lat])
+    .addTo(map);
+
+  centerMarkerDot(marker, el, site.key);
+  activeSiteMarkers.set(site.key, {
+    marker,
+    el,
+    lastName: status.name,
+    lastState: status.state,
+  });
+}
+
+function removeSiteMarker(site) {
+  const entry = activeSiteMarkers.get(site.key);
+  if (entry) {
+    entry.marker.remove();
+    activeSiteMarkers.delete(site.key);
   }
 }
 
-// Show markers for events whose year <= currentYear, hide those with year > currentYear
-function updateMapForYear(currentYear) {
-  // safety
-  if (!timelineEvents || !Array.isArray(timelineEvents)) return;
-  timelineEvents.forEach((ev) => {
-    if (ev.year <= currentYear) {
-      if (!activeEventMarkers[ev.name]) addEventMarker(ev);
-    } else {
-      if (activeEventMarkers[ev.name]) removeEventMarker(ev);
+// Show a dot for each site once its (first) start year is reached, hide
+// ones that haven't started yet, and update label/color in place as sites
+// get renamed, transferred, or decommissioned while scrolling through years.
+const currentYearBadge = document.getElementById("current-year-badge");
+
+function updateMapForYear(currentYear, contentOffset) {
+  if (currentYearBadge) currentYearBadge.textContent = currentYear;
+
+  if (!Array.isArray(siteGroups)) return;
+  siteGroups.forEach((site) => {
+    const status = getSiteStatusAtOffset(site, contentOffset);
+    const entry = activeSiteMarkers.get(site.key);
+
+    if (!status) {
+      if (entry) removeSiteMarker(site);
+      return;
+    }
+
+    if (!entry) {
+      addSiteMarker(site, status);
+      return;
+    }
+
+    if (entry.lastName !== status.name || entry.lastState !== status.state) {
+      entry.el.querySelector(".label").textContent = status.name;
+      entry.el.classList.remove("transferred", "abandoned");
+      if (status.state !== "active") entry.el.classList.add(status.state);
+      entry.lastName = status.name;
+      entry.lastState = status.state;
+      centerMarkerDot(entry.marker, entry.el, site.key);
     }
   });
+
+  updateRowCamera(contentOffset);
 }
+
+// Label positions are computed ONCE (not on every map move/pan/zoom), so
+// they never wobble as the camera flies around -- a fixed pixel offset per
+// site, applied via the marker's own setOffset alongside its dot-centering
+// offset (see centerMarkerDot), which MapLibre re-projects correctly on its
+// own without any further recalculation needed.
+let siteLabelOffsets = new Map();
+
+function precomputeSiteLabelOffsets() {
+  siteLabelOffsets = new Map();
+  if (!mapReady || siteGroups.length === 0) return;
+
+  // Measure each site's label off-screen using its eventual/final name, so
+  // the separation math has realistic sizes even for sites that haven't
+  // appeared yet chronologically.
+  const measureHost = document.createElement("div");
+  measureHost.style.position = "fixed";
+  measureHost.style.visibility = "hidden";
+  measureHost.style.whiteSpace = "nowrap";
+  measureHost.className = "event-marker";
+  document.body.appendChild(measureHost);
+
+  const items = siteGroups.map((site) => {
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = currentSiteName(site);
+    measureHost.innerHTML = "";
+    measureHost.appendChild(label);
+    const rect = label.getBoundingClientRect();
+    const pos = map.project([site.lon, site.lat]);
+    return {
+      site,
+      baseX: pos.x,
+      baseY: pos.y,
+      width: rect.width || 60,
+      height: rect.height || 16,
+      dx: 0,
+      dy: 0,
+    };
+  });
+  measureHost.remove();
+
+  const pad = 4;
+  const maxDrift = 36;
+  for (let iter = 0; iter < 40; iter++) {
+    let moved = false;
+    for (let i = 0; i < items.length; i++) {
+      for (let j = i + 1; j < items.length; j++) {
+        const a = items[i];
+        const b = items[j];
+        const ax = a.baseX + a.dx;
+        const ay = a.baseY + a.dy;
+        const bx = b.baseX + b.dx;
+        const by = b.baseY + b.dy;
+
+        const overlapX = (a.width + b.width) / 2 + pad - Math.abs(ax - bx);
+        const overlapY = (a.height + b.height) / 2 + pad - Math.abs(ay - by);
+
+        if (overlapX > 0 && overlapY > 0) {
+          moved = true;
+          if (overlapX < overlapY) {
+            const dir = ax <= bx ? -1 : 1;
+            a.dx += dir * overlapX * 0.5;
+            b.dx -= dir * overlapX * 0.5;
+          } else {
+            const dir = ay <= by ? -1 : 1;
+            a.dy += dir * overlapY * 0.5;
+            b.dy -= dir * overlapY * 0.5;
+          }
+        }
+      }
+    }
+    if (!moved) break;
+  }
+
+  items.forEach((item) => {
+    siteLabelOffsets.set(item.site.key, {
+      dx: Math.max(-maxDrift, Math.min(maxDrift, item.dx)),
+      dy: Math.max(-maxDrift, Math.min(maxDrift, item.dy)),
+    });
+  });
+
+  // Refresh any markers that were already placed before offsets existed
+  // (possible if a site's start year is reached before this has run once).
+  activeSiteMarkers.forEach((entry, key) => {
+    centerMarkerDot(entry.marker, entry.el, key);
+  });
+}
+
+// === Row-driven map camera ===
+// Camera moves are entirely explicit now, driven only by "Zoom in" / "Zoom
+// out" / "Zoom in slightly" Map Event rows -- not inferred from any row
+// having a Lat/Lon. The sheet author places these rows exactly where a
+// transition should happen (typically with a "Zoom out" between two
+// different places), so there's no automatic reset-first heuristic here.
+let activeLocationKey = "default";
+const CAMERA_DURATION = 1600;
+
+function flyCameraTo(key, lon, lat, zoomLevel) {
+  if (key === activeLocationKey) return;
+  activeLocationKey = key;
+  map.flyTo({
+    center: key === "default" ? DEFAULT_MAP_CENTER : [lon, lat],
+    zoom: key === "default" ? DEFAULT_MAP_ZOOM : zoomLevel,
+    essential: true,
+    duration: CAMERA_DURATION,
+  });
+}
+
+function updateRowCamera(contentOffset) {
+  if (!mapReady || !yearLayout) return;
+  const active = yearLayout.activeZoomEventAtOffset(contentOffset);
+  if (!active) {
+    flyCameraTo("default", null, null, DEFAULT_MAP_ZOOM);
+    return;
+  }
+  const { mapEvent, lat, lon } = active.row;
+  if (mapEvent === "Zoom out") {
+    flyCameraTo("default", null, null, DEFAULT_MAP_ZOOM);
+  } else if (mapEvent === "Zoom in slightly") {
+    flyCameraTo(`slight:${lat},${lon}`, lon, lat, SLIGHT_ZOOM_LEVEL);
+  } else {
+    flyCameraTo(`${lat},${lon}`, lon, lat, CLOSEUP_MAP_ZOOM);
+  }
+}
+
+// A row's own card(s) tied to a place shouldn't be readable before the map
+// has actually zoomed to *some* event -- not just scrolled near one. Gated
+// loosely (any non-default camera state, not an exact-coordinate match) so
+// a single mismatched/rounded coordinate in the sheet can't strand a card
+// permanently hidden, and so a "Zoom in slightly" covering several sites at
+// once (the DYE cluster) doesn't fail to match any single site's own point.
+let settledLocationKey = "default";
+map.on("moveend", () => {
+  settledLocationKey = activeLocationKey;
+  updateCardVisibilityForCamera();
+});
+
+function updateCardVisibilityForCamera() {
+  const contentDiv = document.getElementById("content");
+  const zoomedIn = settledLocationKey !== "default";
+  contentDiv.querySelectorAll("[data-row-index]").forEach((card) => {
+    const idx = parseInt(card.dataset.rowIndex, 10);
+    const row = timelineRows[idx];
+    if (!row || !row.hasLocation) {
+      card.classList.remove("awaiting-arrival");
+      return;
+    }
+    card.classList.toggle("awaiting-arrival", !zoomedIn);
+  });
+}
+
 // === Timeline / Scroll marker setup ===
-// timeline maps page scroll to years
+// timeline rail's year-label range (independent of the actual row data range)
 const startYear = 1940;
 const endYear = 2025;
 const yearsDiv = document.getElementById("years");
 
+const yearLabelEls = [];
 for (let y = startYear; y <= endYear; y += 5) {
   const el = document.createElement("div");
+  el.className = "year-label";
   el.textContent = y;
+  el.dataset.year = y;
   yearsDiv.appendChild(el);
+  yearLabelEls.push(el);
+}
+
+// Vertical layout is driven directly by the ordered timeline rows. A row
+// with real content (text/image) gets a full slot; a bare Map Event row
+// gets much less -- just enough to have its own distinct position -- except
+// a zoom-type event, which gets a generous slot so its flyTo has room to
+// land before the reader scrolls past it. Skipped calendar years still
+// insert extra empty space, so scrolling paces out over elapsed time.
+const CONTENT_ROW_HEIGHT = 650;
+const EVENT_ROW_HEIGHT = 20;
+const ZOOM_ROW_HEIGHT = 450;
+const ROW_GAP = 40;
+const YEAR_GAP_PIXELS = 100;
+const ZOOM_EVENT_TYPES = ["Zoom in", "Zoom out", "Zoom in slightly"];
+const SITE_EVENT_TYPES = ["Start", "End", "Ownership Transfer", "Rename"];
+// Small lead so a zoom's flyTo can start just before the reader reaches its
+// row, without skipping ahead through the row's own generous height.
+const ZOOM_LEAD_PIXELS = 150;
+// Minimum scroll distance a "Zoom in"/"Zoom in slightly" stays the active
+// camera target once triggered, before a later zoom-type row (typically a
+// "Zoom out") is allowed to take over -- guarantees any status-changing row
+// (Ownership Transfer, End, Rename) placed shortly after it, and the flyTo
+// animation itself, both get room to actually happen before the camera
+// leaves.
+const ZOOM_DWELL_PIXELS = 400;
+
+function rowHeightFor(row) {
+  if (row.hasContent) return CONTENT_ROW_HEIGHT;
+  if (ZOOM_EVENT_TYPES.includes(row.mapEvent)) return ZOOM_ROW_HEIGHT;
+  return EVENT_ROW_HEIGHT;
+}
+
+function computeYearLayout() {
+  const padding = 200;
+  const placements = [];
+  let cursor = padding;
+  let prevYear = null;
+
+  timelineRows.forEach((row) => {
+    if (prevYear !== null) {
+      cursor += Math.max(0, row.year - prevYear) * YEAR_GAP_PIXELS;
+    }
+    const top = cursor;
+    const bottom = top + rowHeightFor(row);
+    placements.push({ row, top, bottom, year: row.year });
+
+    cursor = bottom + ROW_GAP;
+    prevYear = row.year;
+  });
+
+  const contentHeight = Math.max(padding * 2, Math.round(cursor + padding));
+
+  // Pixel position of a given calendar year, interpolated between the rows
+  // that bracket it (rows are the only real anchor points now).
+  function yearTop(year) {
+    if (placements.length === 0) return padding;
+    if (year <= placements[0].year) return placements[0].top;
+    if (year >= placements[placements.length - 1].year) {
+      return placements[placements.length - 1].top;
+    }
+    for (let i = 0; i < placements.length - 1; i++) {
+      const a = placements[i];
+      const b = placements[i + 1];
+      if (year >= a.year && year <= b.year) {
+        if (b.year === a.year) return a.top;
+        const t = (year - a.year) / (b.year - a.year);
+        return a.top + t * (b.top - a.top);
+      }
+    }
+    return placements[placements.length - 1].top;
+  }
+
+  // Inverse of yearTop, for the year-label/marker highlighting. Strictly
+  // before the first row's own position, this reads as startYear (not that
+  // row's year) -- so a page load at scrollTop 0 shows a year before
+  // anything has happened yet, and doesn't reveal that row's map markers
+  // until the reader has actually scrolled into its transition gap.
+  function yearAtContentOffset(offset) {
+    if (placements.length === 0) return startYear;
+    if (offset < placements[0].top) return startYear;
+    if (offset >= placements[placements.length - 1].top) {
+      return placements[placements.length - 1].year;
+    }
+    for (let i = 0; i < placements.length - 1; i++) {
+      const a = placements[i];
+      const b = placements[i + 1];
+      if (offset >= a.top && offset <= b.top) {
+        if (b.top === a.top) return a.year;
+        const t = (offset - a.top) / (b.top - a.top);
+        return Math.round(a.year + t * (b.year - a.year));
+      }
+    }
+    return placements[placements.length - 1].year;
+  }
+
+  // The most recent zoom-type Map Event row at or before this offset. Uses
+  // a small lead so its flyTo can start just ahead of actually reaching it,
+  // AND a minimum dwell distance once a zoom becomes active, so a "Zoom
+  // out" (or another Zoom in) placed only a short distance after it -- e.g.
+  // an Ownership Transfer/End row sandwiched right before the Zoom out --
+  // can't supersede it before there's been room for that in-between row to
+  // register and for the flyTo to actually finish. Two floors enforce this:
+  // (1) never earlier than the immediately preceding row's own top, whatever
+  // that row is -- ZOOM_LEAD_PIXELS is only meant to give a small head start
+  // within the gap right before a zoom row, not to reach backward past
+  // *another* row that happens to sit closer than that (e.g. a same-year
+  // "Ownership Transfer" row only 60px ahead of its "Zoom out"); (2) a
+  // minimum dwell since a "Zoom in"/"Zoom in slightly" became active, as a
+  // floor even when nothing else happens to sit in between. Not applied
+  // when the active placement is itself a "Zoom out", since returning to
+  // the default view isn't a place that needs protecting from being cut
+  // short.
+  function activeZoomEventAtOffset(offset) {
+    let active = null;
+    let previousBottom = -Infinity;
+    for (const placement of placements) {
+      if (ZOOM_EVENT_TYPES.includes(placement.row.mapEvent)) {
+        const dwellFloor =
+          active && active.row.mapEvent !== "Zoom out"
+            ? active.top + ZOOM_DWELL_PIXELS
+            : -Infinity;
+        const earliestTrigger = Math.max(
+          placement.top - ZOOM_LEAD_PIXELS,
+          // The FULL preceding row (its bottom, not just its top) has to be
+          // behind us -- using its top would let this trigger fire at the
+          // exact same offset the preceding row first reveals itself at,
+          // which reads as simultaneous rather than "after".
+          previousBottom,
+          dwellFloor
+        );
+        if (offset >= earliestTrigger) {
+          active = placement;
+        } else {
+          break;
+        }
+      }
+      previousBottom = placement.bottom;
+    }
+    return active;
+  }
+
+  return {
+    padding,
+    placements,
+    contentHeight,
+    yearTop,
+    yearAtContentOffset,
+    activeZoomEventAtOffset,
+  };
+}
+
+let yearLayout = computeYearLayout();
+
+// The rail reads as a plain, evenly-spaced ruler (1940 to 2025) independent
+// of how content is actually distributed -- content pacing/camera timing
+// stays entirely row-driven (see computeYearLayout), but the visual rail is
+// simple and predictable. The scroll marker's *position on this scale* is
+// still driven by the true current year (see updateScrollMarker), so it
+// stays aligned with these labels even though the underlying content isn't
+// evenly spaced at all.
+function uniformYearFraction(year) {
+  return (year - startYear) / (endYear - startYear);
+}
+
+// Position each year label evenly along the rail.
+function positionYearLabels() {
+  const timelinePanel = document.getElementById("timeline");
+  const parentHeight = timelinePanel.clientHeight || window.innerHeight;
+
+  yearLabelEls.forEach((el) => {
+    const y = parseInt(el.dataset.year, 10);
+    el.style.top = `${uniformYearFraction(y) * parentHeight}px`;
+  });
+
+  renderSiteLegend();
+}
+
+// === Expandable vertical site legend ===
+const TIMELINE_WIDTH = 54; // must match #timeline's width in style.css
+const legendToggle = document.getElementById("legend-toggle");
+const siteLegendEl = document.getElementById("site-legend");
+const siteLegendColumnsEl = document.getElementById("site-legend-columns");
+const mapLegendEl = document.getElementById("map-legend");
+let siteLegendOpen = false;
+
+// One column per site: a vertical bar (colored active/transferred/abandoned
+// by y-position, using the same evenly-spaced year<->pixel mapping as the
+// year labels) and small vertical text with the site's current name.
+function renderSiteLegend() {
+  if (!siteLegendColumnsEl) return;
+  const timelinePanel = document.getElementById("timeline");
+  const parentHeight = timelinePanel.clientHeight || window.innerHeight;
+  const toY = (year, colHeight) => uniformYearFraction(year) * colHeight;
+
+  siteLegendColumnsEl.innerHTML = "";
+
+  siteGroups.forEach((site) => {
+    const col = document.createElement("div");
+    col.className = "site-col";
+    siteLegendColumnsEl.appendChild(col); // live in the DOM so its own height and the label height below are measurable
+
+    // .site-col's own rendered height is #site-legend-columns' height minus
+    // its 20px top+bottom padding -- NOT the same as parentHeight (the
+    // timeline's height, used only as a fallback/reference scale) above.
+    // Positioning against parentHeight instead of this actual local height
+    // let labels/bars run past the column's real bottom edge, clipped off
+    // by #site-legend's overflow:hidden a few pixels in.
+    const colHeight = col.clientHeight || parentHeight;
+
+    // Anchored at the bottom of the column, not above each bar's own start
+    // -- a label positioned right above the bar's start clipped off-screen
+    // for any site starting near 1940 (right at the top of the rail), since
+    // there was no room above it to clamp into.
+    const label = document.createElement("div");
+    label.className = "site-label";
+    label.textContent = currentSiteName(site);
+    col.appendChild(label);
+
+    const labelHeight = label.offsetHeight || 40;
+    const labelTop = Math.max(0, colHeight - labelHeight - 8);
+    label.style.top = `${labelTop}px`;
+
+    // Trimmed so the bar stops right above the label instead of running on
+    // through it -- otherwise an ongoing site's bar (extending to "now")
+    // draws straight through its own bottom-anchored label text.
+    const barBottomLimit = labelTop - 4;
+
+    const track = document.createElement("div");
+    track.className = "site-bar-track";
+    getSiteBarSegments(site).forEach((seg) => {
+      const top = Math.min(toY(seg.from, colHeight), barBottomLimit);
+      const bottom = Math.min(toY(seg.to, colHeight), barBottomLimit);
+      if (bottom <= top) return;
+      const segEl = document.createElement("div");
+      segEl.className = `site-bar-segment ${seg.status}`;
+      segEl.style.top = `${top}px`;
+      segEl.style.height = `${bottom - top}px`;
+      track.appendChild(segEl);
+    });
+    col.appendChild(track);
+  });
+
+  if (siteLegendOpen) sizeSiteLegend();
+}
+
+// Width depends only on how many site columns there are, computed in JS
+// (rather than left as "auto") so the open/close width transition can animate.
+function sizeSiteLegend() {
+  const colWidth = 11; // must match .site-col's width in style.css
+  const gap = 3; // must match #site-legend-columns' gap in style.css
+  const padding = 20;
+  const count = siteGroups.length;
+  const width =
+    count > 0 ? count * colWidth + (count - 1) * gap + padding * 2 : 0;
+  siteLegendEl.style.width = `${width}px`;
+  legendToggle.style.left = `${TIMELINE_WIDTH + width}px`;
+  return width;
+}
+
+// The vertical site legend is a plain overlay on top of the (permanently
+// static) basemap -- resizing #map to make room for it caused a visible
+// glitch on the map itself, so the map's size/position never changes here.
+// Hidden by default, appearing only on hover/click of the arrow. The dot
+// legend (#map-legend) is separate and always visible (see
+// updateChromeVisibility) -- it doesn't hide/collapse with this toggle.
+// Its own width stays fixed, but its LEFT position tracks the toggle's (see
+// below), so it always sits just to the right of wherever the Gantt bars
+// currently end -- flush against the timeline when collapsed, sliding
+// right to stay flush against the toggle when they pop out -- rather than
+// overlapping/covering the bars, which is what happened when its width
+// used to grow to match theirs instead.
+function setSiteLegendOpen(open) {
+  siteLegendOpen = open;
+  let ganttWidth = 0;
+  if (open) {
+    renderSiteLegend();
+    ganttWidth = sizeSiteLegend();
+    legendToggle.textContent = "‹";
+    legendToggle.setAttribute("aria-label", "Hide site legend");
+  } else {
+    siteLegendEl.style.width = "0px";
+    legendToggle.style.left = `${TIMELINE_WIDTH}px`;
+    legendToggle.textContent = "›";
+    legendToggle.setAttribute("aria-label", "Show site legend");
+  }
+  if (mapLegendEl) {
+    mapLegendEl.style.left = `${TIMELINE_WIDTH + ganttWidth}px`;
+  }
+}
+
+// Hover the arrow to expand; move off both the arrow and the open panel to
+// auto-collapse (a short grace period so crossing the gap between them
+// doesn't flicker it shut). Click still works too, mainly for touch devices.
+let closeLegendTimer = null;
+function cancelLegendClose() {
+  if (closeLegendTimer) {
+    clearTimeout(closeLegendTimer);
+    closeLegendTimer = null;
+  }
+}
+function scheduleLegendClose() {
+  cancelLegendClose();
+  closeLegendTimer = setTimeout(() => {
+    setSiteLegendOpen(false);
+    closeLegendTimer = null;
+  }, 220);
+}
+
+if (legendToggle) {
+  // A real click is always preceded by a mouseenter, which already opens
+  // the panel -- a toggle here would immediately flip it shut again right
+  // after opening. Click only reinforces "make sure it's open" (relevant
+  // for touch, where hover doesn't fire); closing is mouseleave's job.
+  legendToggle.addEventListener("click", () => {
+    cancelLegendClose();
+    setSiteLegendOpen(true);
+  });
+  legendToggle.addEventListener("mouseenter", () => {
+    cancelLegendClose();
+    setSiteLegendOpen(true);
+  });
+  legendToggle.addEventListener("mouseleave", scheduleLegendClose);
+}
+if (siteLegendEl) {
+  siteLegendEl.addEventListener("mouseenter", cancelLegendClose);
+  siteLegendEl.addEventListener("mouseleave", scheduleLegendClose);
 }
 
 const marker = document.getElementById("scroll-marker");
-// Markers placed on the map for events with coordinates
-const eventMarkers = [];
-const timelineEvents = [
-  {
-    name: "Pituffik Space Base",
-    year: 1951,
-    lat: 76.5312,
-    lon: -68.7032,
-  },
-  { name: "Camp TUTO", year: 1954, lat: 76.15, lon: -67.8 },
-  { name: "Camp Century", year: 1960, lat: 77.1667, lon: -61.1333 },
-  { name: "Camp Fistclench", year: 1957, lat: 77.0, lon: -49.6 },
-  { name: "Project Iceworm", year: 1958, lat: 77.8, lon: -61.4 },
-  {
-    name: "Narsarsuaq Air Base",
-    year: 1941,
-    lat: 61.16,
-    lon: -45.43,
-  },
-  { name: "Inge Lehmann Station", year: 1950, lat: 69.14, lon: -49.95 },
-  { name: "Station Nord", year: 1952, lat: 81.6, lon: -16.6667 },
-  { name: "DYE-2 (DEW Line)", year: 1957, lat: 66.481, lon: -46.3 },
-];
 
-// Track active markers currently shown on the map (keyed by event name)
-const activeEventMarkers = {};
+// Sites shown as dots on the map, built from the timeline sheet's own Map
+// Event rows (Start/End/Ownership Transfer/Rename) -- there's no separate
+// Locations sheet anymore. Grouped by coordinate, since a site can have
+// multiple events over time (e.g. Thule Air Base renamed to Pituffik Space
+// Base in 2023) -- events at the same coordinate are one continuous site.
+let siteGroups = [];
+
+// Active map markers, keyed by site.key (coordinate), since a site's label
+// can change over time even while the marker itself stays up.
+const activeSiteMarkers = new Map();
 let mapReady = false;
+
+function siteKeyFor(lat, lon) {
+  return `${lat.toFixed(4)},${lon.toFixed(4)}`;
+}
+
+function buildSiteGroupsFromTimeline(rows) {
+  const groups = new Map();
+  rows.forEach((row) => {
+    if (!row.mapEvent || !SITE_EVENT_TYPES.includes(row.mapEvent)) return;
+    if (!row.hasLocation) return;
+    const key = siteKeyFor(row.lat, row.lon);
+    if (!groups.has(key)) {
+      groups.set(key, { key, lat: row.lat, lon: row.lon, events: [] });
+    }
+    groups.get(key).events.push({
+      year: row.year,
+      type: row.mapEvent,
+      name: row.name,
+      rowIndex: row.index,
+    });
+  });
+  const result = Array.from(groups.values());
+  // Sort by sheet row order (not year) -- unambiguous even when two events
+  // share a calendar year, and it's what the reveal-lag lookup below relies
+  // on for "this event's row" positioning.
+  result.forEach((g) => g.events.sort((a, b) => a.rowIndex - b.rowIndex));
+  result.sort((a, b) => a.events[0].rowIndex - b.events[0].rowIndex);
+  return result;
+}
+
+// A site's current display name: whichever Start/Rename event most recently
+// applied (Ownership Transfer/End don't change the name).
+function currentSiteName(site) {
+  for (let i = site.events.length - 1; i >= 0; i--) {
+    const ev = site.events[i];
+    if (ev.type === "Start" || ev.type === "Rename") return ev.name;
+  }
+  return site.events[site.events.length - 1]?.name || "";
+}
+
+// Replays a site's event stream up to a given scroll position: active once
+// Started, transferred once an Ownership Transfer has occurred (unless
+// since ended), abandoned once Ended. Returns null if nothing has fired yet.
+//
+// Gated on each event's OWN row position, not on calendar year: a Start row
+// often shares its exact year with the "Zoom in" row just above it (e.g.
+// Thule's Zoom in and Start are both 1951), and large year gaps elsewhere
+// insert blank same-year padding rows well before the real event -- so
+// "year has been reached" can go true long before the reader has actually
+// scrolled to that row. No extra buffer is added on top of the row's own
+// position: the generous height reserved for zoom-type rows (see
+// ZOOM_ROW_HEIGHT) already gives a Start row real scroll-distance after its
+// Zoom in, and ZOOM_DWELL_PIXELS (see activeZoomEventAtOffset) keeps a
+// later Zoom out from cutting that distance short.
+function getSiteStatusAtOffset(site, contentOffset) {
+  let currentName = null;
+  let state = null;
+  for (const ev of site.events) {
+    const placement = yearLayout && yearLayout.placements[ev.rowIndex];
+    const revealOffset = placement ? placement.top : Infinity;
+    if (contentOffset < revealOffset) break;
+    if (ev.type === "Start") {
+      currentName = ev.name;
+      state = "active";
+    } else if (ev.type === "Rename") {
+      currentName = ev.name;
+    } else if (ev.type === "Ownership Transfer") {
+      state = "transferred";
+    } else if (ev.type === "End") {
+      state = "abandoned";
+    }
+  }
+  if (state === null) return null;
+  return { name: currentName, state };
+}
+
+// A site's lifespan as colored segments for the vertical Gantt legend:
+// active (green) until an Ownership Transfer (if any), then transferred
+// (blue), until an End, then abandoned (red) from there to "now". Rename
+// doesn't start a new segment (just changes the displayed name elsewhere).
+function getSiteBarSegments(site) {
+  const segments = [];
+  let segStart = null;
+  let segStatus = null;
+
+  site.events.forEach((ev) => {
+    if (ev.type === "Start") {
+      segStart = ev.year;
+      segStatus = "active";
+    } else if (ev.type === "Ownership Transfer" && segStart !== null) {
+      segments.push({ from: segStart, to: ev.year, status: segStatus });
+      segStart = ev.year;
+      segStatus = "transferred";
+    } else if (ev.type === "End" && segStart !== null) {
+      segments.push({ from: segStart, to: ev.year, status: segStatus });
+      segments.push({ from: ev.year, to: endYear, status: "abandoned" });
+      segStart = null;
+      segStatus = null;
+    }
+  });
+
+  if (segStart !== null) {
+    segments.push({ from: segStart, to: endYear, status: segStatus });
+  }
+  return segments;
+}
 
 // scrolling container (we render scrollbar on #app)
 const scrollContainer = document.getElementById("app") || window;
 
-function updateScrollMarker() {
-  // Compute scroll percent relative to the timeline content (the long #content)
-  // Use a global scroll percent derived from the scrolling container so the
-  // custom thumb reflects the user's position across all content.
-  const viewportHeight = window.innerHeight;
+// #content is preceded in the scroll flow by #intro-wrapper (the full-height
+// title screen plus the intro text below it), so scroll position has to be
+// re-based to #content's own coordinate space before it can be run through
+// yearLayout.
+function getTitleHeight() {
+  const introWrapper = document.getElementById("intro-wrapper");
+  return introWrapper ? introWrapper.offsetHeight : 0;
+}
+
+// Current scroll position as a 0-1 fraction of the way through #content.
+function getScrollFraction() {
+  if (!yearLayout || yearLayout.contentHeight <= 0) return 0;
   let scrollTop = 0;
-  let totalScrollable = 0;
   if (scrollContainer === window) {
     scrollTop = window.scrollY;
-    totalScrollable = document.documentElement.scrollHeight - viewportHeight;
   } else {
     scrollTop = scrollContainer.scrollTop;
-    totalScrollable =
-      scrollContainer.scrollHeight - scrollContainer.clientHeight;
   }
+  const contentScrollY = Math.max(0, scrollTop - getTitleHeight());
+  return Math.max(0, Math.min(1, contentScrollY / yearLayout.contentHeight));
+}
 
-  const scrollPercent =
-    totalScrollable > 0
-      ? Math.max(0, Math.min(1, scrollTop / totalScrollable))
-      : 0;
+// Scroll the page so a given 0-1 fraction through #content is at the top of
+// the viewport. Used by the clickable/draggable scroll marker.
+function setScrollFraction(fraction) {
+  if (!yearLayout) return;
+  fraction = Math.max(0, Math.min(1, fraction));
+  const targetContentY = fraction * yearLayout.contentHeight;
+  const rawTarget = getTitleHeight() + targetContentY;
 
-  // Position marker relative to the timeline element height
-  const timelineEl = document.getElementById("timeline");
-  const parentHeight = timelineEl.clientHeight || window.innerHeight;
+  const viewportHeight = window.innerHeight;
+  let maxScroll;
+  if (scrollContainer === window) {
+    maxScroll = document.documentElement.scrollHeight - viewportHeight;
+  } else {
+    maxScroll = scrollContainer.scrollHeight - scrollContainer.clientHeight;
+  }
+  const targetScrollTop = Math.max(0, Math.min(maxScroll, rawTarget));
+
+  if (scrollContainer === window) {
+    window.scrollTo({ top: targetScrollTop });
+  } else {
+    scrollContainer.scrollTop = targetScrollTop;
+  }
+}
+
+// The timeline rail, current-year badge, and bottom-right legend stay
+// invisible through the title/intro screen, fading in as the reader
+// approaches the end of the intro text (so they're not competing with it),
+// fully visible by the time #content actually begins. Applied to the actual
+// visible elements individually (not a zero-size wrapper) so the fade is
+// never abrupt.
+function updateChromeVisibility() {
+  const introWrapper = document.getElementById("intro-wrapper");
+  const timelinePanel = document.getElementById("timeline");
+  const mapLegend = document.getElementById("map-legend");
+  if (!introWrapper) return;
+
+  const introHeight = introWrapper.offsetHeight;
+  const scrollTop =
+    scrollContainer === window ? window.scrollY : scrollContainer.scrollTop;
+
+  const fadeStart = introHeight * 0.6;
+  const fadeEnd = introHeight;
+  const opacity =
+    fadeEnd > fadeStart
+      ? Math.max(0, Math.min(1, (scrollTop - fadeStart) / (fadeEnd - fadeStart)))
+      : 1;
+
+  const visible = opacity > 0.05;
+  [timelinePanel, legendToggle, siteLegendEl].forEach((el) => {
+    if (!el) return;
+    el.style.opacity = opacity;
+    el.style.pointerEvents = visible ? "" : "none";
+  });
+  if (currentYearBadge) currentYearBadge.style.opacity = opacity;
+  if (mapLegend) mapLegend.style.opacity = opacity;
+}
+
+function updateScrollMarker() {
+  updateChromeVisibility();
+  if (!yearLayout || yearLayout.contentHeight <= 0) return;
+
+  const fraction = getScrollFraction();
+  const contentOffset = fraction * yearLayout.contentHeight;
+  const currentYear = yearLayout.yearAtContentOffset(contentOffset);
+
+  // The rail shows years evenly spaced (see uniformYearFraction), so the
+  // marker's position comes from the current year on that same even scale
+  // -- not from raw scroll fraction -- to stay aligned with the labels even
+  // though the underlying content isn't evenly spaced at all.
+  const timelinePanel = document.getElementById("timeline");
+  const parentHeight = timelinePanel.clientHeight || window.innerHeight;
   const markerHeight = marker.offsetHeight || 30;
-  const markerTop = scrollPercent * (parentHeight - markerHeight);
+  const markerTop = uniformYearFraction(currentYear) * (parentHeight - markerHeight);
   marker.style.top = `${markerTop}px`;
 
-  // Update custom scroll thumb
-  const thumb = timelineEl.querySelector(".scroll-thumb");
-  if (thumb) {
-    // Keep thumb centered like marker but with its own height
-    const thumbHeight = thumb.offsetHeight || 30;
-    const thumbTop = scrollPercent * (parentHeight - thumbHeight);
-    thumb.style.top = `${thumbTop}px`;
-  }
-
-  // Compute current year and highlight map markers based on content scroll
-  // Determine current year from scroll percent. Use floor so the event shows
-  // when the user has reached that year or passed it.
-  const currentYear = Math.floor(
-    startYear + scrollPercent * (endYear - startYear)
-  );
-  updateMapForYear(currentYear);
+  updateMapForYear(currentYear, contentOffset);
 }
 
 if (scrollContainer === window) {
@@ -227,6 +922,59 @@ if (scrollContainer === window) {
 } else {
   scrollContainer.addEventListener("scroll", updateScrollMarker);
 }
+
+// === Clickable / draggable scroll marker ===
+const timelineEl = document.getElementById("timeline");
+
+function jumpToTimelinePointer(clientY) {
+  const rect = timelineEl.getBoundingClientRect();
+  const railFraction = rect.height > 0 ? (clientY - rect.top) / rect.height : 0;
+  // The rail position is a year on the evenly-spaced scale; convert that
+  // back to where that year's content actually is (yearTop, row-driven) to
+  // find the scroll fraction to jump to -- not the raw rail fraction, which
+  // would land on whatever year happens to be there in the non-uniform
+  // content layout instead of the year the reader actually clicked on.
+  const targetYear = startYear + railFraction * (endYear - startYear);
+  const contentOffset = yearLayout ? yearLayout.yearTop(targetYear) : 0;
+  const scrollFraction =
+    yearLayout && yearLayout.contentHeight > 0
+      ? contentOffset / yearLayout.contentHeight
+      : railFraction;
+  setScrollFraction(scrollFraction);
+  updateScrollMarker();
+}
+
+let isDraggingMarker = false;
+
+marker.addEventListener("pointerdown", (e) => {
+  isDraggingMarker = true;
+  marker.setPointerCapture(e.pointerId);
+  jumpToTimelinePointer(e.clientY);
+  e.stopPropagation();
+});
+
+marker.addEventListener("pointermove", (e) => {
+  if (!isDraggingMarker) return;
+  jumpToTimelinePointer(e.clientY);
+});
+
+function endMarkerDrag(e) {
+  if (!isDraggingMarker) return;
+  isDraggingMarker = false;
+  try {
+    marker.releasePointerCapture(e.pointerId);
+  } catch (err) {
+    // ignore
+  }
+}
+
+marker.addEventListener("pointerup", endMarkerDrag);
+marker.addEventListener("pointercancel", endMarkerDrag);
+
+// Clicking anywhere else on the timeline rail jumps straight to that point.
+timelineEl.addEventListener("click", (e) => {
+  jumpToTimelinePointer(e.clientY);
+});
 
 window.addEventListener("resize", () => {
   // recompute marker placement on resize
@@ -241,187 +989,140 @@ window.addEventListener("load", () => {
   updateScrollMarker();
 });
 
-function createTextCards(textItems) {
-  const contentDiv = document.getElementById("content");
-  if (!Array.isArray(textItems)) return;
-
-  textItems.forEach((item) => {
-    const div = document.createElement("div");
-    div.className = "text-card";
-    div.dataset.year = item.year;
-    div.dataset.yOffset = item.yOffset || 0;
-    div.dataset.xOffset = item.xOffset || 0;
-    div.style.position = "absolute";
-
-    div.innerHTML = `
-      <div class="text-card-inner">
-        <strong>${item.year}</strong> ${item.content}
-      </div>
-    `;
-
-    contentDiv.appendChild(div);
-  });
-
-  // store for layout positioning
-  contentDiv._textItems = textItems;
-
-  // immediately position them
-  updateLayout();
-  updateScrollMarker();
-}
-
-// === Load CSV ===
-async function loadImageCSV() {
+// === Timeline rows (single combined sheet: text, photos, and Map Events) ===
+// Each row is either text-only, an image+caption, or a bare Map Event (no
+// visible content -- purely a marker/camera trigger), in the exact order
+// the sheet gives them (not re-sorted).
+async function loadTimelineCSV() {
   try {
-    const res = await fetch(IMAGE_SHEET_CSV_URL);
+    const res = await fetch(TIMELINE_SHEET_CSV_URL);
     const csvText = await res.text();
-
-    // Use PapaParse for CSV parsing
-    const data = Papa.parse(csvText, {
-      header: true,
-      skipEmptyLines: true,
-    }).data;
-    createImageCards(data);
-    updateLayout();
-    updateScrollMarker();
-  } catch (err) {
-    console.error("Error loading CSV:", err);
-  }
-}
-
-async function loadTextCSV() {
-  try {
-    const res = await fetch(TEXT_SHEET_CSV_URL);
-    const csvText = await res.text();
-
-    // Use PapaParse for CSV parsing
     const data = Papa.parse(csvText, {
       header: true,
       skipEmptyLines: true,
     }).data;
 
-    const textItems = [];
-
-    data.forEach((row) => {
-      const year = parseInt(row["Year"]);
+    const rows = [];
+    data.forEach((raw) => {
+      const year = parseInt(raw["Year"], 10);
       if (!year || isNaN(year)) return;
 
-      const content = row["Text"] || "";
-      if (!content.trim()) return;
+      const mapEvent = (raw["Map Event"] || "").trim();
+      const name = (raw["Name"] || "").trim();
+      const lat = parseFloat(raw["Lat"]);
+      const lon = parseFloat(raw["Lon"]);
+      const hasLocation = !isNaN(lat) && !isNaN(lon);
 
-      const location = row["Location"] || "";
-      const yOffset = row["Y Offset"] ? parseFloat(row["Y Offset"]) : 0;
-      const xOffset = row["X Offset"] ? parseFloat(row["X Offset"]) : 0;
+      const imageId = (raw["Image"] || "").trim();
+      const imageSource = (raw["Image Source"] || "").trim();
+      const caption = (raw["Caption"] || "").trim();
+      const hasContent = !!caption || !!imageId;
 
-      textItems.push({
+      if (!hasContent && !mapEvent) return; // nothing to show, nothing to trigger
+
+      // index is this row's own position in the FILTERED array (matching
+      // yearLayout.placements' indexing 1:1), not its raw position in the
+      // sheet -- rows get skipped above, so the two diverge once any row
+      // before this one has been dropped.
+      rows.push({
+        index: rows.length,
         year,
-        content,
-        location,
-        xOffset,
-        yOffset,
-        raw: row,
+        mapEvent,
+        name,
+        lat: hasLocation ? lat : null,
+        lon: hasLocation ? lon : null,
+        hasLocation,
+        imageId,
+        imageSource,
+        caption,
+        hasContent,
       });
     });
 
-    createTextCards(textItems);
+    timelineRows = rows;
+    siteGroups = buildSiteGroupsFromTimeline(rows);
+    createTimelineCards(rows);
+    updateCardVisibilityForCamera();
+    updateLayout();
+    // The window "load" event (which also calls this) can fire before this
+    // CSV fetch resolves, computing the thumb's height against the tiny
+    // placeholder layout that exists before real rows are in -- leaving it
+    // stuck oversized forever since nothing recomputed it afterward.
+    updateScrollThumb();
+    updateScrollMarker();
+    precomputeSiteLabelOffsets();
   } catch (err) {
-    console.error("Error loading CSV:", err);
+    console.error("Error loading timeline CSV:", err);
   }
 }
 
-// === Create Image Cards ===
-function createImageCards(data) {
+// === Create timeline cards ===
+function createTimelineCards(rows) {
   const contentDiv = document.getElementById("content");
-  const validItems = [];
-  data.forEach((item) => {
-    const dateStr = item["Date"] || "";
-    const yearMatch = dateStr.match(/\b(19|20)\d{2}\b/);
-    if (!yearMatch) return; // skip items without a valid year
-    const year = parseInt(yearMatch[0], 10);
-    if (year < startYear || year > endYear) return; // skip out-of-range
 
-    const link = item["Link"] || item["Source"] || "";
-    const caption = item["Caption"] || "";
-    const id = item["ID"] || item["File"] || "";
-    const xOffset = item["X Offset"] ? parseFloat(item["X Offset"]) : 0;
-    const yOffset = item["Y Offset"] ? parseFloat(item["Y Offset"]) : 0;
+  rows.forEach((row) => {
+    if (!row.hasContent) return; // bare Map Event rows render nothing
 
-    validItems.push({ year, link, caption, id, xOffset, yOffset, raw: item });
-  });
-
-  // Store reference for layout calculations
-  contentDiv._timelineItems = validItems;
-
-  // Create DOM elements for each valid item
-  validItems.forEach((it) => {
     const card = document.createElement("div");
-    card.className = "image-card";
-    card.dataset.year = it.year;
+    card.dataset.rowIndex = row.index;
+    card.dataset.year = row.year;
     card.style.position = "absolute";
 
-    const fullPath = getExistingImagePath(it.id);
+    if (row.imageId) {
+      card.className = "image-card";
+      const fullPath = getExistingImagePath(row.imageId);
 
-    card.dataset.xOffset = it.xOffset;
-    card.dataset.yOffset = it.yOffset;
+      if (fullPath) {
+        card.innerHTML = `
+          <img src="${fullPath}" alt="${row.caption}" />
+          <div class="card-caption">
+            <p class="caption-text">${row.caption}</p>
+          </div>
+        `;
+      } else {
+        console.warn(`No image found for ${row.imageId}`);
+        card.innerHTML = `
+          <div class="missing">Image missing for ${row.imageId}</div>
+          <div class="card-caption">
+            <p class="caption-text">${row.caption || ""}</p>
+          </div>
+        `;
+      }
 
-    if (fullPath) {
-      card.innerHTML = `
-      <img src="${fullPath}" alt="${it.caption}" />
+      card.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openCardFullScreen(card, row);
+      });
 
-      <div class="card-caption">
-        <p class="caption-text">${it.caption}</p>
-      </div>
-    `;
+      const imgEl = card.querySelector("img");
+      if (imgEl && !imgEl.complete) {
+        imgEl.addEventListener("load", () => {
+          // clear any previous placed flag so layout can place it using correct dims
+          delete card.dataset.placed;
+          updateLayout();
+          updateScrollMarker();
+        });
+      }
     } else {
-      console.warn(`No image found for ${it.id} / ${it.link}`);
-      card.innerHTML = `
-      <div class="missing">Image missing for ${it.id}</div>
-      <div class="card-caption">
-        <p class="caption-text"><strong>${it.year}</strong> — ${
-        it.caption || ""
-      }</p>
-      </div>
-    `;
+      card.className = "text-card";
+      card.innerHTML = `<div class="text-card-inner">${row.caption}</div>`;
     }
-
-    // click to expand to full-screen view. We'll create an overlay to handle outside clicks.
-    card.addEventListener("click", (e) => {
-      e.stopPropagation();
-      openCardFullScreen(card, it);
-    });
 
     contentDiv.appendChild(card);
-
-    // If the image is not yet loaded, re-run layout when it finishes loading so
-    // we measure the real width/height before placement. This prevents overlap
-    // caused by unknown dimensions.
-    const imgEl = card.querySelector("img");
-    if (imgEl && !imgEl.complete) {
-      imgEl.addEventListener("load", () => {
-        // clear any previous placed flag so layout can place it using correct dims
-        delete card.dataset.placed;
-        updateLayout();
-        updateScrollMarker();
-      });
-    }
   });
 
   // Reveal cards only when they enter near the viewport for better UX
   const observer = new IntersectionObserver(
     (entries) => {
       entries.forEach((entry) => {
-        if (entry.isIntersecting) {
-          entry.target.classList.add("visible");
-        } else {
-          entry.target.classList.remove("visible");
-        }
+        entry.target.classList.toggle("visible", entry.isIntersecting);
       });
     },
     { root: null, rootMargin: "400px 0px 400px 0px", threshold: 0.01 }
   );
-  // observe all cards
-  const cards = contentDiv.querySelectorAll(".image-card");
-  cards.forEach((c) => observer.observe(c));
+  contentDiv
+    .querySelectorAll(".image-card, .text-card")
+    .forEach((c) => observer.observe(c));
 }
 
 // Overlay element for closing expanded view (used by FLIP clone)
@@ -434,116 +1135,126 @@ function ensureOverlay() {
   }
 }
 
-// FLIP-style open/close using a clone so original layout doesn't jump
+// FLIP-style open/close: clones the WHOLE card (its shared blurred
+// background panel included, not just the raw image) so that background
+// visibly moves and scales up together with the image, instead of a plain
+// floating image appearing while the card's own panel stays behind.
 let currentClone = null;
-let currentOriginal = null;
-let currentCaption = null;
-let captionOriginal = null;
+let currentOriginalCard = null;
 
-function openCardFullScreen(card, item) {
+function openCardFullScreen(card, row) {
   ensureOverlay();
   const img = card.querySelector("img");
-  const caption = card.querySelector("div");
   if (!img) return;
 
-  // close existing
   if (currentClone) closeImgFullScreen();
 
-  const rect = img.getBoundingClientRect();
+  const cardRect = card.getBoundingClientRect();
+  const imgRect = img.getBoundingClientRect();
   const vw = window.innerWidth;
   const vh = window.innerHeight;
 
-  // combined max height for image + caption --
-  const maxCombinedH = vh * 0.9;
-  const captionH = 60; // estimate
-  const maxImageH = maxCombinedH - captionH;
-
-  const maxW = vw * 0.8;
-
-  // natural aspect ratio
+  // The whole card (image + caption) scales up together as one unit (see
+  // `scale` below), so oversized bounds here don't just make the image
+  // bigger -- they blow up the caption text by the same factor, since it's
+  // scaled along with everything else rather than laid out fresh at the
+  // larger size.
+  const maxW = vw * 0.5;
+  const maxH = vh * 0.62;
   const aspect =
-    (img.naturalWidth || rect.width) / (img.naturalHeight || rect.height);
+    (img.naturalWidth || imgRect.width) / (img.naturalHeight || imgRect.height);
 
-  // compute target size
-  let targetW = Math.min(maxW, aspect * maxImageH);
-  let targetH = targetW / aspect;
+  let targetImgW = Math.min(maxW, aspect * maxH);
+  let targetImgH = targetImgW / aspect;
+  if (targetImgH > maxH) {
+    targetImgH = maxH;
+    targetImgW = targetImgH * aspect;
+  }
+  const scale = targetImgW / imgRect.width;
 
-  if (targetH > maxImageH) {
-    targetH = maxImageH;
-    targetW = targetH * aspect;
+  const clone = card.cloneNode(true);
+  clone.style.position = "fixed";
+  clone.style.left = `${cardRect.left}px`;
+  clone.style.top = `${cardRect.top}px`;
+  clone.style.width = `${cardRect.width}px`;
+  clone.style.maxWidth = "none";
+  clone.style.margin = "0";
+  clone.style.overflow = "hidden";
+  clone.style.transition = "transform 320ms ease";
+  clone.style.transformOrigin = "top left";
+  clone.style.zIndex = 100001;
+  clone.style.cursor = "default";
+  clone.style.pointerEvents = "none";
+
+  // The caption is scaled up right along with the image by the clone's own
+  // transform below (one transform, one animation, for the whole card) --
+  // so its rendered text size ends up different for every photo, tracking
+  // whatever `scale` that image's aspect ratio happened to produce. A
+  // counter-transform here cancels that out, keeping it pinned to its
+  // natural (unscaled) size regardless of `scale`. No transition needed on
+  // it -- composed with the clone's own animating transform, it rides
+  // along for free, landing on a net visual scale of exactly 1 once the
+  // clone's animation finishes.
+  const captionEl = clone.querySelector(".card-caption");
+  if (captionEl) {
+    if (row && row.imageSource) {
+      const link = document.createElement("a");
+      link.href = row.imageSource;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.className = "fullscreen-source-link";
+      link.textContent = "Image Source";
+      captionEl.appendChild(link);
+    }
+    captionEl.style.transformOrigin = "top left";
   }
 
-  // create clone
-  const clone = img.cloneNode(true);
-  clone.style.position = "fixed";
-  clone.style.left = `${rect.left}px`;
-  clone.style.top = `${rect.top}px`;
-  clone.style.width = `${rect.width}px`;
-  clone.style.height = `${rect.height}px`;
-  clone.style.transition = "all 320ms ease";
-  // clone sits above overlay but below caption
-  clone.style.zIndex = 100001;
-  clone.style.boxSizing = "border-box";
-
+  // Appended before measuring captionEl below -- offsetHeight on a node
+  // that isn't attached to the document yet always reads 0 (there's no
+  // layout to measure), which was silently zeroing out the whole
+  // reserved-height calculation just below.
   document.body.appendChild(clone);
-
-  // hide original
-  card.opacity = 0;
-  img.style.visibility = "hidden";
-  caption.style.visibility = "hidden";
-  currentOriginal = img;
+  card.style.visibility = "hidden";
+  currentOriginalCard = card;
   currentClone = clone;
-  captionOriginal = caption;
 
-  // show overlay (fade in)
+  // Measured AFTER appending the source link, since that adds its own
+  // height -- this is the caption's true natural (unscaled) height.
+  const captionNaturalHeight = captionEl ? captionEl.offsetHeight : 0;
+
+  // The clone's own height, left to "auto", would size the card as if the
+  // caption still occupied its full natural height -- but the counter-
+  // transform above changes what the caption actually renders as, without
+  // changing the space normal flow reserves for it (transforms never
+  // affect layout). Setting the height explicitly instead, in the same
+  // (pre-transform) coordinate space the clone's own scale transform
+  // operates in, keeps the card's edge landing exactly where the image and
+  // the now constant-size caption actually end -- not too tall (an empty
+  // gap below the caption for photos needing little zoom-in) or too short
+  // (the caption cropped/overflowing for photos needing to shrink slightly
+  // to fit the height bound).
+  const cardPaddingTop = 6; // .image-card's own CSS padding-top; its bottom padding is 0
+  const safetyMargin = 6; // small buffer against sub-pixel rounding in the measurements above
+  const unscaledCloneHeight =
+    cardPaddingTop + imgRect.height + captionNaturalHeight / scale + safetyMargin;
+  clone.style.height = `${unscaledCloneHeight}px`;
+
   overlayEl.style.display = "block";
   overlayEl.style.pointerEvents = "auto";
-  // ensure a frame so transition runs
   requestAnimationFrame(() => {
     overlayEl.style.opacity = "1";
   });
 
-  // compute center translation
-  const cx = vw / 2;
-  const cy = vh / 2 - captionH / 2; // shift up so caption fits below
-  const tx = cx - (rect.left + rect.width / 2);
-  const ty = cy - (rect.top + rect.height / 2);
-  const scale = targetW / rect.width;
+  const scaledW = cardRect.width * scale;
+  const scaledH = unscaledCloneHeight * scale;
+  const cx = (vw - scaledW) / 2;
+  const cy = (vh - scaledH) / 2;
+  const tx = cx - cardRect.left;
+  const ty = cy - cardRect.top;
 
   requestAnimationFrame(() => {
     clone.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
-  });
-
-  // caption (positioned under the final image)
-  const captionDiv = document.createElement("div");
-  captionDiv.className = "fullscreen-caption";
-  captionDiv.style.position = "fixed";
-  captionDiv.style.left = `${cx - targetW / 2}px`;
-  captionDiv.style.top = `${cy + targetH / 2 + 10}px`;
-  captionDiv.style.width = `${targetW}px`;
-  captionDiv.style.background = "rgba(0, 0, 0, 0.5)";
-  captionDiv.style.color = "white";
-  captionDiv.style.padding = "10px";
-  // caption must be topmost so it's visible above overlay and clone
-  captionDiv.style.zIndex = 100002;
-  captionDiv.style.opacity = "0";
-  captionDiv.innerHTML =
-    `<p style="margin:0"><strong>${item.year}</strong> — ${
-      item.caption || ""
-    }</p>` +
-    (item.link
-      ? `<div><a href="${item.link}" target="_blank" rel="noopener">Source</a></div>`
-      : "");
-
-  // append caption to body so it's always above overlay/clone
-  document.body.appendChild(captionDiv);
-  currentCaption = captionDiv;
-
-  overlayEl.style.display = "block";
-  clone.addEventListener("transitionend", function onEnd() {
-    captionDiv.style.transition = "opacity 200ms ease";
-    captionDiv.style.opacity = "1";
-    clone.removeEventListener("transitionend", onEnd);
+    if (captionEl) captionEl.style.transform = `scale(${1 / scale})`;
   });
 
   overlayEl.onclick = closeImgFullScreen;
@@ -551,36 +1262,22 @@ function openCardFullScreen(card, item) {
 
 function closeImgFullScreen() {
   if (!currentClone) return;
-  // hide caption
-  if (currentCaption) currentCaption.style.opacity = "0";
-  // reverse animate to original
   currentClone.style.transform = "none";
-  currentClone.style.left = `${currentOriginal.getBoundingClientRect().left}px`;
-  currentClone.style.top = `${currentOriginal.getBoundingClientRect().top}px`;
-  currentClone.style.width = `${
-    currentOriginal.getBoundingClientRect().width
-  }px`;
-  currentClone.style.height = `${
-    currentOriginal.getBoundingClientRect().height
-  }px`;
-  // fade out overlay
+  const captionEl = currentClone.querySelector(".card-caption");
+  if (captionEl) captionEl.style.transform = "none";
   if (overlayEl) {
     overlayEl.style.opacity = "0";
     overlayEl.style.pointerEvents = "none";
   }
-  currentClone.addEventListener("transitionend", function onEnd() {
-    currentClone.remove();
-    currentCaption && currentCaption.remove();
-    currentOriginal && (currentOriginal.style.visibility = "");
-    captionOriginal && (captionOriginal.style.visibility = "");
-
-    currentClone = null;
-    currentCaption = null;
-    currentOriginal = null;
-    // hide overlay after transition completes
+  const clone = currentClone;
+  const originalCard = currentOriginalCard;
+  clone.addEventListener("transitionend", function onEnd() {
+    clone.remove();
+    if (originalCard) originalCard.style.visibility = "";
+    if (currentClone === clone) currentClone = null;
+    if (currentOriginalCard === originalCard) currentOriginalCard = null;
     if (overlayEl) overlayEl.style.display = "none";
-    setTimeout(() => updateLayout(), 40);
-    currentClone && currentClone.removeEventListener("transitionend", onEnd);
+    clone.removeEventListener("transitionend", onEnd);
   });
 }
 
@@ -589,232 +1286,85 @@ const papaScript = document.createElement("script");
 papaScript.src =
   "https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js";
 papaScript.onload = async () => {
-  await loadImageCSV();
-  await loadTextCSV();
+  await loadTimelineCSV();
 };
 
 document.head.appendChild(papaScript);
 
-// Layout - timeline card positioning
+// Layout - timeline card positioning. Each content row gets its own
+// dedicated [top, bottom) band from yearLayout (see computeYearLayout), so
+// unlike the old per-year system there's no competing content to
+// scatter/collide within a band -- just a modest random position for
+// visual variety. Bare Map Event rows have no card to place.
 function updateLayout() {
   const contentDiv = document.getElementById("content");
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  let leftStart = 40;
-  const padding = 200;
-  const basePixelsPerYear = 120; // default spacing per year
-  const stretchFactor = 20; // how much denser years can expand (1 = no stretch)
 
-  // Count items per year (images + text) to compute density
-  const counts = {};
-  const imageItems = contentDiv._timelineItems || [];
-  const textItems = contentDiv._textItems || [];
-  imageItems.forEach((it) => (counts[it.year] = (counts[it.year] || 0) + 1));
-  textItems.forEach((it) => (counts[it.year] = (counts[it.year] || 0) + 1));
+  yearLayout = computeYearLayout();
+  const { contentHeight, placements } = yearLayout;
 
-  // Find max count to normalize
-  let maxCount = 0;
-  for (let y = startYear; y <= endYear; y++) {
-    if ((counts[y] || 0) > maxCount) maxCount = counts[y];
-  }
-
-  // Build per-year spacing array
-  const yearSpacing = [];
-  let totalSpacing = 0;
-  for (let y = startYear; y <= endYear; y++) {
-    const c = counts[y] || 0;
-    const extraRatio = maxCount > 0 ? c / maxCount : 0;
-    // spacing scales between basePixelsPerYear and basePixelsPerYear * stretchFactor
-    const spacing = basePixelsPerYear * (1 + extraRatio * (stretchFactor - 1));
-    yearSpacing.push(spacing);
-    totalSpacing += spacing;
-  }
-
-  const totalYears = endYear - startYear + 1;
-  const contentHeight = Math.round(totalSpacing + padding * 2);
   contentDiv.style.height = contentHeight + "px";
   contentDiv.style.position = "relative";
   const contentWidth = contentDiv.clientWidth;
 
-  // helper to compute top position for a given year (center of its band)
-  const yearTop = (year) => {
-    const index = year - startYear;
-    let cum = 0;
-    for (let i = 0; i < index; i++) cum += yearSpacing[i];
-    // center of the year's band
-    return padding + cum + yearSpacing[index] / 2;
-  };
-
-  // --- IMAGES ---
-  // Collect all cards and group UNPLACED cards by year for banded placement.
-  // Cards that already have a stored placement (data-placed) will be left alone.
-  const allCards = Array.from(
-    contentDiv.querySelectorAll(".image-card, .text-card")
-  );
-  const cardsByYear = {};
-  allCards.forEach((card) => {
-    const y = parseInt(card.dataset.year, 10);
-    if (!y || isNaN(y)) return;
-
-    // If this card already has a fixed placement (from an earlier run), keep it.
-    if (card.dataset.placed === "1") {
-      if (card.dataset.left) card.style.left = card.dataset.left;
-      if (card.dataset.top) card.style.top = card.dataset.top;
-      return; // skip repositioning
-    }
-
-    if (!cardsByYear[y]) cardsByYear[y] = [];
-    cardsByYear[y].push(card);
+  const cardsByIndex = new Map();
+  contentDiv.querySelectorAll(".image-card, .text-card").forEach((card) => {
+    cardsByIndex.set(card.dataset.rowIndex, card);
   });
 
-  // For each year, attempt to place cards randomly inside that year's vertical band
-  // Maintain a global list of placed rects so placements from one year don't
-  // overlap items placed for other years.
-  const globalPlaced = [];
+  const centerX = Math.round(contentWidth / 2);
+  const spread = Math.round(contentWidth * 0.35);
+  const minLeft = 16;
 
-  // initialize globalPlaced with any previously placed cards so we avoid
-  // overlapping earlier placements
-  allCards.forEach((card) => {
-    if (card.dataset.placed === "1") {
-      const leftPx =
-        parseInt(card.dataset.left || card.style.left || "0px", 10) || 0;
-      const topPx =
-        parseInt(card.dataset.top || card.style.top || "0px", 10) || 0;
-      const cw = card.offsetWidth || 80;
-      const ch = card.offsetHeight || 40;
-      globalPlaced.push({
-        left: leftPx,
-        top: topPx,
-        right: leftPx + cw,
-        bottom: topPx + ch,
-      });
-    }
+  placements.forEach((placement) => {
+    const card = cardsByIndex.get(String(placement.row.index));
+    if (!card || card.dataset.placed === "1") return;
+
+    const cw = Math.max(40, card.offsetWidth || 80);
+    const ch = Math.max(24, card.offsetHeight || 40);
+    const maxLeft = Math.max(minLeft, contentWidth - cw - 16);
+
+    const randOffset = Math.round((Math.random() * 2 - 1) * spread);
+    const left = Math.max(
+      minLeft,
+      Math.min(maxLeft, centerX + randOffset - Math.round(cw / 2))
+    );
+    const maxTop = Math.max(placement.top, placement.bottom - ch);
+    // A row gated on camera arrival (see updateCardVisibilityForCamera) can
+    // stay hidden well into its own band while the flyTo/dwell upstream are
+    // still playing out. If its card sat early in that band, the reader
+    // could scroll straight through that hidden stretch -- carrying the
+    // card's fixed position from the bottom of the viewport up past the top
+    // -- before the gate ever clears, so it "pops" into view somewhere
+    // near/above the top instead of easing in from the bottom like anything
+    // else being scrolled to. Placing it at the very end of the band keeps
+    // its on-screen position out of reach until well after arrival.
+    const top = placement.row.hasLocation
+      ? maxTop
+      : Math.round(
+          placement.top + Math.random() * Math.max(0, maxTop - placement.top)
+        );
+
+    card.style.left = `${left}px`;
+    card.style.top = `${top}px`;
+    card.dataset.placed = "1";
   });
 
-  for (let y = startYear; y <= endYear; y++) {
-    const items = cardsByYear[y] || [];
-    if (items.length === 0) continue;
-
-    const index = y - startYear;
-    const bandCenter = yearTop(y);
-    const bandHalf = yearSpacing[index] / 2;
-    const bandTop = Math.max(0, bandCenter - bandHalf + 8);
-    const bandBottom = Math.min(contentHeight, bandCenter + bandHalf - 8);
-
-    // Keep track of placed rects to avoid overlap (share with globalPlaced)
-    const placed = globalPlaced;
-
-    // Shuffle order to avoid predictable stacking
-    const shuffled = items.slice().sort(() => Math.random() - 0.5);
-
-    shuffled.forEach((card, idx) => {
-      const cw = Math.max(40, card.offsetWidth || 80);
-      const ch = Math.max(24, card.offsetHeight || 40);
-
-      const centerX = Math.round(contentWidth / 2);
-      // horizontal spread range (±20% of content width)
-      const spread = Math.round(contentWidth * 0.5);
-      const minLeft = 16;
-      const maxLeft = Math.max(minLeft, contentWidth - cw - 16);
-
-      let placedOk = false;
-      let attempt = 0;
-      const maxAttempts = 200;
-
-      while (!placedOk && attempt < maxAttempts) {
-        attempt++;
-        // random Y inside band (clamp so card fits)
-        const yRangeTop = bandTop;
-        const yRangeBottom = Math.max(bandTop + 2, bandBottom - ch);
-        const randTop = Math.round(
-          yRangeTop + Math.random() * Math.max(0, yRangeBottom - yRangeTop)
-        );
-
-        // random X around center
-        const randOffset = Math.round((Math.random() * 2 - 1) * spread);
-        let left = centerX + randOffset - Math.round(cw / 2);
-        left = Math.max(minLeft, Math.min(maxLeft, left));
-
-        const rect = {
-          left,
-          top: randTop,
-          right: left + cw,
-          bottom: randTop + ch,
-        };
-
-        // check overlap with small padding
-        const pad = 12;
-        let conflict = false;
-        for (const r of placed) {
-          if (
-            !(
-              rect.right + pad < r.left ||
-              rect.left - pad > r.right ||
-              rect.bottom + pad < r.top ||
-              rect.top - pad > r.bottom
-            )
-          ) {
-            conflict = true;
-            break;
-          }
-        }
-
-        if (!conflict) {
-          // accept place and persist placement so future layout runs won't reshuffle
-          card.style.left = `${left}px`;
-          card.style.top = `${randTop}px`;
-          card.dataset.placed = "1";
-          card.dataset.left = card.style.left;
-          card.dataset.top = card.style.top;
-          placed.push(rect);
-          // also add to globalPlaced so subsequent years respect this rect
-          if (placed !== globalPlaced) globalPlaced.push(rect);
-          placedOk = true;
-        }
-      }
-
-      if (!placedOk) {
-        // fallback: stack them vertically from the top of the band
-        const left = Math.max(
-          16,
-          Math.min(contentWidth / 2 - Math.round(cw / 2), maxLeft)
-        );
-        const topFallback = bandTop + idx * (ch + 6);
-        const finalTop = Math.min(topFallback, bandBottom - ch);
-        card.style.left = `${left}px`;
-        card.style.top = `${finalTop}px`;
-        card.dataset.placed = "1";
-        card.dataset.left = card.style.left;
-        card.dataset.top = card.style.top;
-        if (placed !== globalPlaced)
-          globalPlaced.push({
-            left: parseInt(card.style.left, 10) || 0,
-            top: parseInt(card.style.top, 10) || 0,
-            right: (parseInt(card.style.left, 10) || 0) + cw,
-            bottom: (parseInt(card.style.top, 10) || 0) + ch,
-          });
-      }
-    });
-  }
+  positionYearLabels();
 }
 
-// Create or update a custom scroll thumb inside #timeline that represents viewport
+// Size the scroll marker itself to reflect the viewport/content ratio, like a
+// native scrollbar thumb.
 function updateScrollThumb() {
-  const timelineEl = document.getElementById("timeline");
-  let thumb = timelineEl.querySelector(".scroll-thumb");
-  const contentEl = document.getElementById("content");
-  const viewport = window.innerHeight;
-  const contentHeight = contentEl.offsetHeight;
-  if (!thumb) {
-    thumb = document.createElement("div");
-    thumb.className = "scroll-thumb";
-    timelineEl.appendChild(thumb);
-  }
+  if (!yearLayout || yearLayout.contentHeight <= 0) return;
+  const timelinePanel = document.getElementById("timeline");
+  const parentHeight = timelinePanel.clientHeight || window.innerHeight;
+  const viewportHeight = window.innerHeight;
+  const totalTrackHeight = getTitleHeight() + yearLayout.contentHeight;
 
-  // Thumb height reflects viewport/content ratio (min 20px)
-  const ratio = Math.max(0.02, Math.min(1, viewport / contentHeight));
-  const parentHeight = timelineEl.clientHeight || window.innerHeight;
-  const thumbHeight = Math.max(20, ratio * parentHeight);
-  thumb.style.height = `${thumbHeight}px`;
-  // Position will be set in updateScrollMarker (which knows scrollPercent)
+  const ratio =
+    totalTrackHeight > 0
+      ? Math.max(0.03, Math.min(1, viewportHeight / totalTrackHeight))
+      : 0.1;
+  const markerHeight = Math.max(10, ratio * parentHeight);
+  marker.style.height = `${markerHeight}px`;
 }

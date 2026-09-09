@@ -1,13 +1,19 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Greenland Military Research Map</title>
-    <link rel="stylesheet" href="style.css" />
-    <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css"
+      href="https://fonts.googleapis.com/css2?family=Roboto:wght@100;300;400;500;700;900&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+    <link
+      href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css"
       rel="stylesheet"
     />
   </head>
@@ -18,18 +24,97 @@
           <div id="years"></div>
           <div id="scroll-marker"></div>
         </div>
+        <button id="legend-toggle" aria-label="Show site legend">›</button>
+        <div id="site-legend">
+          <div id="site-legend-columns"></div>
+        </div>
       </div>
       <div id="map"></div>
 
-      <!-- Title screen-->
-      <section id="title-screen">
-        <div class="title-inner">
-          <h1>geopolitics on ice</h1>
-          <p class="subtitle">
-            an infrastructural archive of U.S. intervention in Greenland
-          </p>
+      <div id="current-year-badge"></div>
+
+      <div id="map-legend">
+        <div id="map-legend-inner">
+          <div class="legend-item">
+            <span class="legend-dot active"></span>
+            Active
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot abandoned"></span>
+            Abandoned
+          </div>
+          <div class="legend-item">
+            <span class="legend-dot transferred"></span>
+            Ownership Transferred
+          </div>
         </div>
-      </section>
+      </div>
+
+      <!-- Title + intro: one continuous fading overlay over the map -->
+      <div id="intro-wrapper">
+        <section id="title-screen">
+          <div class="title-inner">
+            <h1>Infrastructures On Ice</h1>
+            <p class="subtitle">
+              A geographic archive of American intervention in Greenland
+            </p>
+          </div>
+        </section>
+
+        <section id="intro-text">
+          <p>
+            Greenland has been subject to the strategic occupational whims of
+            the United States for the past century. During the Cold War, the
+            U.S. military constructed a constellation of infrastructures across
+            the island: base camps, airstrips, research sites, radar stations,
+            seismic outposts, ice tunnels, and a nuclear power plant. Today, the
+            vast majority of these architectural interventions remain abandoned
+            on and in the Greenland ice sheet. The United States continues to
+            deny legal obligation for remediation of military waste and its
+            associated contaminations under Article XI of the 1951 Defense
+            Agreement, which states that “any areas or facilities made available
+            to the Government of the United States of America under this
+            Agreement need not be left in the condition in which they were at
+            the time they were thus made available.”
+          </p>
+          <p>
+            The following digital atlas spatializes archival documentation of
+            infrastructural interventions by the United States in Greenland from
+            the twentieth century to the present. Maps, photographs, diagrams,
+            plans, and declassified documents illustrate how military and
+            ecological violence are continually inscribed onto Greenland's
+            arctic landscape.
+          </p>
+          <p>
+            Heat thematically links Cold War militarization, glacial
+            engineering, nuclear infrastructure, and contemporary climate
+            change. Camp Century was a secret U.S. Army base that was built in
+            1959, including a nuclear power plant under the guise of scientific
+            research. The camp was built under the ice sheet, relying on the ice
+            to act as a thermal sink for its nuclear reactors. As shifting ice
+            collapsed several tunnels, the base and its radioactive waste were
+            abandoned in 1967 with minimal decommissioning, assumed to remain
+            frozen in time. Recent studies, however, show that climate change
+            induced ice sheet melting is expected to resurface Camp Century's
+            nuclear waste within the century, posing a toxic environmental
+            hazard whose responsibility falls on Denmark. Yet, ironically, the
+            United States military alone emits more greenhouse gases than the
+            entire country of Denmark. Camp Century is just one site that
+            collapses temperature across spatial and temporal scales to
+            destabilize notions of permanence and stability.
+          </p>
+          <p>
+            The physical traces of U.S. militarism that remain embedded in
+            Greenland highlight tensions between the ice—vast, dynamic, deep
+            time—and its imposing architectures—discrete, static, short-lived.
+            This infrastructure-oriented atlas contextualizes the United States'
+            continued interest in acquiring Greenland as a strategic territory
+            for military expansion and resource extraction, grounding this
+            imperialist ideology in concrete interventions and their enduring
+            material consequences.
+          </p>
+        </section>
+      </div>
 
       <!-- Map-->
       <div id="content"></div>
